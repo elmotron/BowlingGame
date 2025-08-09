@@ -3,8 +3,10 @@
 #include "BowlingGameMode.h"
 
 #include "BowlingBall.h"
+#include "BowlingCharacter.h"
 #include "BowlingGameUtils.h"
 #include "BowlingPinSet.h"
+#include "Kismet/GameplayStatics.h"
 #include "UObject/ConstructorHelpers.h"
 
 ABowlingGameGameMode::ABowlingGameGameMode() : Super()
@@ -17,16 +19,21 @@ ABowlingGameGameMode::ABowlingGameGameMode() : Super()
 void ABowlingGameGameMode::BeginPlay()
 {
 	Super::BeginPlay();
+
+	if (APawn* Pawn = UGameplayStatics::GetPlayerPawn(this, 0))
+	{
+		Character = Cast<ABowlingGameCharacter>(Pawn);
+	}	
 }
 
 void ABowlingGameGameMode::StartNewGame()
 {
 	Score = 0;
-	CurrentFrame = 0;
+	CurrentThrowIndex = -1;
 	
-	for (int32& FramePoints : Frames)
+	for (auto& FrameThrow : FrameThrows)
 	{
-		FramePoints = 0;
+		FrameThrow = 0;
 	}	
 
 	StartNewFrame();
@@ -68,50 +75,108 @@ void ABowlingGameGameMode::ResetPinSet()
 
 void ABowlingGameGameMode::StartNewFrame()
 {
-	CurrentFrame++;
-	CurrentThrow = 1;
+	if (CurrentThrowIndex >= 0)
+	{
+		// Advance to next frame
+		CurrentThrowIndex += 2 - (CurrentThrowIndex % 2);	
+	}
+	else
+	{
+		CurrentThrowIndex = 0;
+	}
+
 	ResetPinSet();
 }
 
 void ABowlingGameGameMode::ComputeScore()
 {
-	Score = 5; // TODO
+	Score = 0;
+	int ThrowIndex = 0;
+	for (int Frame = 0; Frame < 10; ++Frame, ThrowIndex += 2)
+	{
+		if (IsStrike(ThrowIndex))
+		{
+			Score += 10 + StrikeBonus(ThrowIndex);
+		}
+		else if (IsSpare(ThrowIndex))
+		{
+			Score += 10 + SpareBonus(ThrowIndex);
+		}
+		else
+		{
+			// Open frame
+			Score += SumOfPinsInFrame(ThrowIndex);
+		}
+	}
+}
+
+void ABowlingGameGameMode::ProcessBallPit()
+{
+	bThrowInProgress = false;
+
+	const int32 CurrentThrow = GetCurrentThrow();
+	const int32 CurrentFrame = GetCurrentFrame();
+
+	const int32 CurrentThrowPinsDown = FrameThrows[CurrentThrowIndex];
+	const int32 CurrentFramePinsDown = FrameThrows[CurrentThrowIndex] + (CurrentThrow > 1 ? FrameThrows[CurrentThrowIndex - 1] : 0);
+
+	if (CurrentFrame < 10 && (CurrentThrow == 2 || CurrentThrowPinsDown == 10))
+	{
+		StartNewFrame();
+	}
+	else if (CurrentFrame == 10)
+	{
+		// Allow extra throws in last frame on spare or strike
+		if (CurrentThrow == 3 || (CurrentThrow == 2 && CurrentFramePinsDown < 10))
+		{
+			// Game ended
+			ComputeScore();
+			bGameInProgress = false;
+			OnGameEnded.Broadcast(Score);
+		}
+		else
+		{
+			if (CurrentFramePinsDown % 10 == 0)
+			{
+				ResetPinSet();	
+			}
+			CurrentThrowIndex++;	
+		}
+	}
+	else
+	{
+		CurrentThrowIndex++;
+	}
 }
 
 void ABowlingGameGameMode::OnPinDown(AActor* Pin)
 {
 	UBowlingGameUtils::DebugPrint(TEXT("Pin down!"), 5.0f, FColor::Yellow);
-	Frames[CurrentFrame - 1]++;
+	FrameThrows[CurrentThrowIndex]++;
 }
 
 void ABowlingGameGameMode::OnBallThrown()
 {
 	bThrowInProgress = true;
-	UBowlingGameUtils::DebugPrint(FString::Printf(TEXT("Ball thrown - Frame %d, Throw %d"), CurrentFrame, CurrentThrow), 5.0f, FColor::Red);
+	UBowlingGameUtils::DebugPrint(FString::Printf(TEXT("Ball thrown - Frame %d, Throw %d"), GetCurrentFrame(), GetCurrentThrow()), 5.0f, FColor::Red);
 }
 
 void ABowlingGameGameMode::OnBallPit(ABowlingGameProjectile* Ball)
 {
-	UBowlingGameUtils::DebugPrint(FString::Printf(TEXT("Ball pit - Frame %d, Throw %d"), CurrentFrame, CurrentThrow), 5.0f, FColor::Red);
-
-	ComputeScore();
-
-	bThrowInProgress = false;
-
-	if (CurrentFrame < 21 && CurrentThrow == 2)
-	{
-		StartNewFrame();
-	}
-	else if (CurrentThrow == 3)
-	{
-		// Game ended
-		bGameInProgress = false;
-		OnGameEnded.Broadcast(Score);
-	}
-	else
-	{
-		CurrentThrow++;
-	}
-
 	Ball->Destroy();
+
+	// Give the pins some time to settle
+
+	FTimerHandle* NewTimerHandle = new FTimerHandle();
+
+	GetWorldTimerManager().SetTimer(
+		*NewTimerHandle,
+		[this, NewTimerHandle]()
+		{
+			ProcessBallPit();
+			delete NewTimerHandle;
+		},
+		2.0,
+		false
+	);	
 }
